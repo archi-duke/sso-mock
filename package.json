@@ -1,0 +1,13 @@
+{
+  "name": "gojira-sso-mock",
+  "version": "1.0.0",
+  "description": "Mock ADFS SSO server for GoJIRA / Platform-App local development (zero dependencies)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=14"
+  },
+  "license": "MIT"
+}
