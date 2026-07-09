@@ -1,52 +1,61 @@
 'use strict';
 
 // ──────────────────────────────────────────────────────────────────────────
-// Mock ADFS SSO 서버 (의존성 없음, 순수 Node.js)
+// Mock ADFS/MobilAve SSO 서버 (의존성 없는 순수 Node.js) — contract 2.0.0
 //
-// GoJIRA / Platform-App 의 SSO 흐름(Platform-App/src/utils/auth.js)을 모킹한다:
-//   1. 앱이 로그인 안 된 상태에서
-//        ${SSO_URL}/Account/ADFSLogin?client=${window.location.origin}
-//      로 top-level 이동한다.
-//   2. 이 서버가 ADSSO_UID 쿠키(= 사용자 ID)를 심고
-//      client(앱 origin) 으로 302 리다이렉트한다.
-//   3. 앱이 document.cookie 로 ADSSO_UID 를 읽어 사용자를 식별한다.
-//      (앱이 JS 로 읽으므로 쿠키는 HttpOnly 가 아니어야 한다.)
+// 셸(Platform-App/src/App.jsx)의 실제 SSO 흐름 = code 교환 + introspect:
+//   1. 미인증 → ${SSO_URL}/Account/ADFSLogin?client=<origin> 로 top-level 이동 (App.jsx:147)
+//   2. 이 서버가 1회용 code 를 발급하고 <client>?auth=1&code=<code> 로 302 리다이렉트
+//      (App.jsx:114-115 가 auth, code 둘 다 있어야 콜백을 처리)
+//   3. 앱이 GET /Account/exchange?code=<code> 호출 → { sessionToken } 수신 (App.jsx:117-120)
+//      앱이 스스로 SSO_SESSION 쿠키를 자기 origin 에 저장 (App.jsx:121)
+//   4. 앱이 GET /Account/introspect?token=<sessionToken> 호출 → { loginid, active } (App.jsx:122-125,141-144)
+//      유효 판정(openapi-auth.yaml): HTTP 200 AND loginid != "" AND active != "false"
 //
-// 쿠키는 포트로 격리되지 않으므로, 이 서버를 앱과 같은 호스트명(localhost)에서
-// 실행하면 다른 포트라도 ADSSO_UID 가 공유된다. 다른 호스트면 부모 도메인을
-// COOKIE_DOMAIN 으로 지정해야 한다.
+// 중요: exchange/introspect 는 앱이 authFetch 로 cross-origin fetch 호출한다
+// (앱 origin ≠ SSO origin). 따라서 CORS 응답 헤더 + OPTIONS 프리플라이트 처리가 필수다.
+// (getToken() 이 토큰을 돌려주면 authFetch 가 Authorization: Bearer 를 붙여 프리플라이트를 유발)
+//
+// 구(舊) ADSSO_UID 쿠키 방식은 contract 2.0.0 에서 폐기됐다. 하위호환용 흔적은 남기지 않는다.
 // ──────────────────────────────────────────────────────────────────────────
 
 const http = require('http');
+const crypto = require('crypto');
 const { URL } = require('url');
 
 const PORT = parseInt(process.env.PORT || '8443', 10);
 const HOST = process.env.HOST || '0.0.0.0';
-// 설정에 지정된 사용자 (Platform-App/src/config.js 의 DEV_USER 기본값과 동일)
+// 기본 모킹 사용자 (Platform-App/src/config.js 의 DEV_USER 기본값과 동일).
 const MOCK_USER = process.env.MOCK_USER || 'duke.kimm';
-// 쿠키 유효기간(초). 기본 1년.
-const COOKIE_MAX_AGE = parseInt(process.env.COOKIE_MAX_AGE || String(60 * 60 * 24 * 365), 10);
-// 다른 호스트 간 공유가 필요할 때만 부모 도메인 지정 (예: ".example.com")
-const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || '';
-// 쿠키 이름 — 앱(auth.js)이 읽는 이름과 일치해야 한다.
-const COOKIE_NAME = 'ADSSO_UID';
+// code 유효기간(초). SSO 콜백~exchange 사이 짧게. 기본 5분.
+const CODE_TTL = parseInt(process.env.CODE_TTL || '300', 10);
+// sessionToken 유효기간(초). 셸 쿠키 max-age(8h)와 맞춘다.
+const SESSION_TTL = parseInt(process.env.SESSION_TTL || String(60 * 60 * 8), 10);
+// 서버 재시작 등으로 code/token 을 잃었을 때, 알 수 없는 code/token 을 MOCK_USER 로
+// 관대하게 처리해 무한 루프를 막는다. 엄격 모드가 필요하면 LENIENT=false.
+const LENIENT = process.env.LENIENT !== 'false';
 
-function log(...args) {
-  // eslint 흉내 없이 단순 로깅
-  console.log('[sso-mock]', ...args);
+// ── 인메모리 저장소 ─────────────────────────────────────────────────────────
+// code → { user, exp } (1회용).  sessionToken → { user, exp }.
+const codes = new Map();
+const sessions = new Map();
+
+function now() {
+  return Math.floor(Date.now() / 1000);
 }
 
-function buildSetCookie(value, maxAge) {
-  // HttpOnly 를 붙이지 않는다 — 앱이 document.cookie 로 읽어야 하므로.
-  // SameSite=Lax: top-level GET 내비게이션(리다이렉트 복귀)에서 쿠키 전송 허용.
-  const parts = [
-    `${COOKIE_NAME}=${encodeURIComponent(value)}`,
-    'Path=/',
-    'SameSite=Lax',
-    `Max-Age=${maxAge}`,
-  ];
-  if (COOKIE_DOMAIN) parts.push(`Domain=${COOKIE_DOMAIN}`);
-  return parts.join('; ');
+function newToken(bytes) {
+  return crypto.randomBytes(bytes).toString('hex');
+}
+
+function sweep() {
+  const t = now();
+  for (const [k, v] of codes) if (v.exp <= t) codes.delete(k);
+  for (const [k, v] of sessions) if (v.exp <= t) sessions.delete(k);
+}
+
+function log(...args) {
+  console.log('[sso-mock]', ...args);
 }
 
 function isSafeClient(client) {
@@ -59,106 +68,183 @@ function isSafeClient(client) {
   }
 }
 
-function sendHtml(res, status, html) {
-  res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8' });
-  res.end(html);
+// cross-origin fetch(authFetch) 를 허용한다. credentials 를 켜므로 ACAO 에 '*' 대신
+// 요청 Origin 을 그대로 반향한다. Origin 이 없으면(top-level 내비게이션 등) '*'.
+function corsHeaders(req) {
+  const origin = req.headers.origin;
+  const h = {
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Authorization, X-User-Id, Content-Type',
+    'Access-Control-Max-Age': '600',
+    Vary: 'Origin',
+  };
+  if (origin) {
+    h['Access-Control-Allow-Origin'] = origin;
+    h['Access-Control-Allow-Credentials'] = 'true';
+  } else {
+    h['Access-Control-Allow-Origin'] = '*';
+  }
+  return h;
 }
 
-function sendJson(res, status, obj) {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+function sendJson(req, res, status, obj) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    ...corsHeaders(req),
+  });
   res.end(JSON.stringify(obj, null, 2));
+}
+
+function sendHtml(req, res, status, html) {
+  res.writeHead(status, {
+    'Content-Type': 'text/html; charset=utf-8',
+    ...corsHeaders(req),
+  });
+  res.end(html);
 }
 
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const path = u.pathname;
 
-  // ── SSO 로그인 엔드포인트 ──────────────────────────────────────────────
-  // 앱이 리다이렉트해 오는 경로. 사용자 쿠키를 심고 client 로 되돌려보낸다.
+  // ── CORS 프리플라이트 ──────────────────────────────────────────────────
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, corsHeaders(req));
+    res.end();
+    return;
+  }
+
+  sweep();
+
+  // ── 1) 로그인 진입: 1회용 code 발급 후 콜백으로 리다이렉트 ─────────────────
+  //    <client>?auth=1&code=<code>  (App.jsx 가 auth+code 로 콜백 인식)
   if (path === '/Account/ADFSLogin') {
     const client = u.searchParams.get('client');
-    // 데모/테스트용으로 ?user= 로 사용자 오버라이드 가능, 없으면 설정값 사용.
-    const user = u.searchParams.get('user') || MOCK_USER;
-
-    const setCookie = buildSetCookie(user, COOKIE_MAX_AGE);
-    log(`ADFSLogin user="${user}" client="${client}"`);
+    const user = u.searchParams.get('user') || MOCK_USER; // ?user= 로 사용자 오버라이드
+    const code = newToken(16);
+    codes.set(code, { user, exp: now() + CODE_TTL });
+    log(`ADFSLogin user="${user}" client="${client}" -> code=${code.slice(0, 8)}…`);
 
     if (isSafeClient(client)) {
-      res.writeHead(302, { 'Set-Cookie': setCookie, Location: client });
+      const cb = new URL(client);
+      cb.searchParams.set('auth', '1');
+      cb.searchParams.set('code', code);
+      res.writeHead(302, { Location: cb.toString(), ...corsHeaders(req) });
       res.end();
       return;
     }
-
-    // client 가 없거나 잘못된 경우: 쿠키만 심고 안내 페이지 표시.
-    res.writeHead(200, {
-      'Set-Cookie': setCookie,
-      'Content-Type': 'text/html; charset=utf-8',
-    });
-    res.end(
-      `<!doctype html><meta charset="utf-8">
-       <title>Mock SSO</title>
+    // client 누락/부적합: 콜백 대신 code 를 안내 (수동 테스트용).
+    sendHtml(
+      req, res, 200,
+      `<!doctype html><meta charset="utf-8"><title>Mock SSO</title>
        <h2>Mock ADFS SSO</h2>
-       <p>쿠키 <code>${COOKIE_NAME}=${user}</code> 를 발급했습니다.</p>
-       <p><code>client</code> 파라미터가 없어 리다이렉트를 생략했습니다.</p>`
+       <p>code 발급: <code>${code}</code> (user=<strong>${user}</strong>)</p>
+       <p><code>client</code> 파라미터가 없어 리다이렉트를 생략했습니다.</p>
+       <p>교환: <code>GET /Account/exchange?code=${code}</code></p>`
     );
     return;
   }
 
-  // ── 로그아웃 ─────────────────────────────────────────────────────────
+  // ── 2) code → sessionToken 교환 ────────────────────────────────────────
+  if (path === '/Account/exchange') {
+    const code = u.searchParams.get('code');
+    let entry = code ? codes.get(code) : null;
+    if (entry) codes.delete(code); // 1회용
+
+    if (!entry) {
+      if (!LENIENT || !code) {
+        sendJson(req, res, 400, { error: 'invalid_or_expired_code' });
+        return;
+      }
+      // 관대 모드: 서버 재시작 등으로 code 유실 시 MOCK_USER 로 세션 발급 (루프 방지).
+      log(`exchange: unknown code=${String(code).slice(0, 8)}… -> fallback user=${MOCK_USER}`);
+      entry = { user: MOCK_USER };
+    }
+
+    const sessionToken = newToken(24);
+    sessions.set(sessionToken, { user: entry.user, exp: now() + SESSION_TTL });
+    log(`exchange -> sessionToken=${sessionToken.slice(0, 8)}… user="${entry.user}"`);
+    sendJson(req, res, 200, { sessionToken });
+    return;
+  }
+
+  // ── 3) sessionToken 검증(신원 확정) ────────────────────────────────────
+  //    유효: 200 AND loginid != "" AND active != "false"
+  if (path === '/Account/introspect') {
+    const token = u.searchParams.get('token');
+    const sess = token ? sessions.get(token) : null;
+
+    if (sess) {
+      sendJson(req, res, 200, { loginid: sess.user, active: 'true' });
+      return;
+    }
+    if (LENIENT && token) {
+      // 관대 모드: 알 수 없는 토큰도 MOCK_USER 로 확정 (재시작 후 세션 복원 실패로 인한 루프 방지).
+      log(`introspect: unknown token=${String(token).slice(0, 8)}… -> fallback user=${MOCK_USER}`);
+      sendJson(req, res, 200, { loginid: MOCK_USER, active: 'true' });
+      return;
+    }
+    // 엄격 모드 또는 토큰 없음: 무효.
+    sendJson(req, res, 200, { loginid: '', active: 'false' });
+    return;
+  }
+
+  // ── 로그아웃: 서버 세션 무효화 후 client 로 복귀 ─────────────────────────
+  //    (SSO_SESSION 쿠키는 앱 origin 소유라 여기서 지울 수 없다 — 앱이 클라이언트에서 삭제)
   if (path === '/Account/Logout' || path === '/logout') {
     const client = u.searchParams.get('client');
-    const expire = buildSetCookie('', 0);
+    const token = u.searchParams.get('token');
+    if (token) sessions.delete(token);
     if (isSafeClient(client)) {
-      res.writeHead(302, { 'Set-Cookie': expire, Location: client });
+      res.writeHead(302, { Location: client, ...corsHeaders(req) });
       res.end();
       return;
     }
-    res.writeHead(200, { 'Set-Cookie': expire, 'Content-Type': 'text/html; charset=utf-8' });
-    res.end('<!doctype html><meta charset="utf-8"><p>로그아웃되었습니다.</p>');
+    sendHtml(req, res, 200, '<!doctype html><meta charset="utf-8"><p>로그아웃되었습니다.</p>');
     return;
   }
 
-  // ── 편의용: 현재 모킹 사용자 확인 ──────────────────────────────────────
+  // ── 편의 엔드포인트 ────────────────────────────────────────────────────
   if (path === '/whoami') {
-    sendJson(res, 200, { user: MOCK_USER });
+    sendJson(req, res, 200, { user: MOCK_USER });
     return;
   }
-
   if (path === '/health') {
-    sendJson(res, 200, { ok: true });
+    sendJson(req, res, 200, { ok: true, codes: codes.size, sessions: sessions.size });
     return;
   }
 
-  // ── 루트 안내 페이지 ─────────────────────────────────────────────────
   if (path === '/') {
     sendHtml(
-      res,
-      200,
+      req, res, 200,
       `<!doctype html><meta charset="utf-8">
-       <title>Mock ADFS SSO</title>
-       <style>body{font-family:system-ui,Segoe UI,sans-serif;max-width:680px;margin:40px auto;padding:0 16px;line-height:1.6}code{background:#f3f3f3;padding:2px 5px;border-radius:4px}</style>
-       <h1>Mock ADFS SSO</h1>
-       <p>현재 모킹 사용자: <strong>${MOCK_USER}</strong></p>
-       <h3>엔드포인트</h3>
+       <title>Mock ADFS SSO (contract 2.0.0)</title>
+       <style>body{font-family:system-ui,Segoe UI,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;line-height:1.6}code{background:#f3f3f3;padding:2px 5px;border-radius:4px}</style>
+       <h1>Mock ADFS/MobilAve SSO <small>(contract 2.0.0)</small></h1>
+       <p>기본 모킹 사용자: <strong>${MOCK_USER}</strong> · 관대모드: <strong>${LENIENT ? 'on' : 'off'}</strong></p>
+       <h3>SSO 흐름 (code 교환 + introspect)</h3>
+       <ol>
+         <li><code>GET /Account/ADFSLogin?client=&lt;origin&gt;</code> — 1회용 code 발급 후 <code>&lt;origin&gt;?auth=1&amp;code=…</code> 로 302 (<code>&amp;user=</code> 오버라이드)</li>
+         <li><code>GET /Account/exchange?code=…</code> — <code>{ "sessionToken": "…" }</code></li>
+         <li><code>GET /Account/introspect?token=…</code> — <code>{ "loginid": "…", "active": "true" }</code></li>
+       </ol>
+       <h3>기타</h3>
        <ul>
-         <li><code>GET /Account/ADFSLogin?client=&lt;app-origin&gt;</code> — ADSSO_UID 쿠키 발급 후 client 로 리다이렉트 (<code>&amp;user=</code> 로 사용자 오버라이드 가능)</li>
-         <li><code>GET /Account/Logout?client=&lt;app-origin&gt;</code> — 쿠키 만료 후 리다이렉트</li>
-         <li><code>GET /whoami</code> — 현재 모킹 사용자(JSON)</li>
-         <li><code>GET /health</code> — 헬스체크</li>
+         <li><code>GET /Account/Logout?client=&lt;origin&gt;&amp;token=…</code> — 세션 무효화 후 복귀</li>
+         <li><code>GET /whoami</code> · <code>GET /health</code></li>
        </ul>
        <h3>앱 연동</h3>
-       <p>앱의 환경변수 / config 를 다음과 같이 설정:</p>
        <pre>REACT_APP_SSO_URL=http://localhost:${PORT}
-USE_SSO=true</pre>
-       <p>쿠키는 포트로 격리되지 않으므로 이 서버를 앱과 같은 호스트(localhost)에서 실행하면 됩니다.</p>`
+REACT_APP_USE_SSO=true</pre>
+       <p>exchange/introspect 는 cross-origin fetch 이므로 CORS 응답 헤더가 포함되어 있습니다.</p>`
     );
     return;
   }
 
-  sendJson(res, 404, { error: 'not found', path });
+  sendJson(req, res, 404, { error: 'not found', path });
 });
 
 server.listen(PORT, HOST, () => {
-  log(`listening on http://${HOST}:${PORT}  (mock user: ${MOCK_USER})`);
-  log(`set app:  REACT_APP_SSO_URL=http://localhost:${PORT}  &  USE_SSO=true`);
+  log(`listening on http://${HOST}:${PORT}  (contract 2.0.0, mock user: ${MOCK_USER}, lenient: ${LENIENT})`);
+  log(`set app:  REACT_APP_SSO_URL=http://localhost:${PORT}  &  REACT_APP_USE_SSO=true`);
 });
