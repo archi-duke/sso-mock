@@ -26,7 +26,11 @@ const { URL } = require('url');
 const PORT = parseInt(process.env.PORT || '8443', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 // 기본 모킹 사용자 (Platform-App/src/config.js 의 DEV_USER 기본값과 동일).
-const MOCK_USER = process.env.MOCK_USER || 'duke.kimm';
+// 시작값은 env 로 정하되, 런타임에 POST/GET /set-user 로 바꿀 수 있다(currentUser).
+const DEFAULT_USER = process.env.MOCK_USER || 'duke.kimm';
+// 현재 활성 모킹 사용자. 기본 로그인(ADFSLogin) · 폴백 · whoami 가 모두 이 값을 따른다.
+// ?user= 오버라이드는 이 값과 무관하게 그 요청에만 적용된다.
+let currentUser = DEFAULT_USER;
 // code 유효기간(초). SSO 콜백~exchange 사이 짧게. 기본 5분.
 const CODE_TTL = parseInt(process.env.CODE_TTL || '300', 10);
 // sessionToken 유효기간(초). 셸 쿠키 max-age(8h)와 맞춘다.
@@ -120,7 +124,7 @@ const server = http.createServer((req, res) => {
   //    <client>?auth=1&code=<code>  (App.jsx 가 auth+code 로 콜백 인식)
   if (path === '/Account/ADFSLogin') {
     const client = u.searchParams.get('client');
-    const user = u.searchParams.get('user') || MOCK_USER; // ?user= 로 사용자 오버라이드
+    const user = u.searchParams.get('user') || currentUser; // ?user= 로 이 요청만 오버라이드
     const code = newToken(16);
     codes.set(code, { user, exp: now() + CODE_TTL });
     log(`ADFSLogin user="${user}" client="${client}" -> code=${code.slice(0, 8)}…`);
@@ -156,9 +160,9 @@ const server = http.createServer((req, res) => {
         sendJson(req, res, 400, { error: 'invalid_or_expired_code' });
         return;
       }
-      // 관대 모드: 서버 재시작 등으로 code 유실 시 MOCK_USER 로 세션 발급 (루프 방지).
-      log(`exchange: unknown code=${String(code).slice(0, 8)}… -> fallback user=${MOCK_USER}`);
-      entry = { user: MOCK_USER };
+      // 관대 모드: 서버 재시작 등으로 code 유실 시 currentUser 로 세션 발급 (루프 방지).
+      log(`exchange: unknown code=${String(code).slice(0, 8)}… -> fallback user=${currentUser}`);
+      entry = { user: currentUser };
     }
 
     const sessionToken = newToken(24);
@@ -179,9 +183,9 @@ const server = http.createServer((req, res) => {
       return;
     }
     if (LENIENT && token) {
-      // 관대 모드: 알 수 없는 토큰도 MOCK_USER 로 확정 (재시작 후 세션 복원 실패로 인한 루프 방지).
-      log(`introspect: unknown token=${String(token).slice(0, 8)}… -> fallback user=${MOCK_USER}`);
-      sendJson(req, res, 200, { loginid: MOCK_USER, active: 'true' });
+      // 관대 모드: 알 수 없는 토큰도 currentUser 로 확정 (재시작 후 세션 복원 실패로 인한 루프 방지).
+      log(`introspect: unknown token=${String(token).slice(0, 8)}… -> fallback user=${currentUser}`);
+      sendJson(req, res, 200, { loginid: currentUser, active: 'true' });
       return;
     }
     // 엄격 모드 또는 토큰 없음: 무효.
@@ -204,9 +208,44 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ── 활성 사용자 변경 API ────────────────────────────────────────────────
+  //    런타임에 기본 모킹 사용자(currentUser)를 바꾼다. 이후 일반 로그인(ADFSLogin,
+  //    ?user= 없이)·폴백·whoami 가 이 사용자로 동작한다. 재기동 없이 즉시 반영.
+  //    - GET  /set-user?user=batman        (브라우저에서 바로 호출 가능)
+  //    - POST /set-user   body: user=batman  또는  {"user":"batman"}
+  //    빈 값이면 DEFAULT_USER(env MOCK_USER) 로 리셋.
+  if (path === '/set-user' || path === '/Account/set-user') {
+    const applyUser = (raw) => {
+      const next = (raw == null || raw === '') ? DEFAULT_USER : String(raw).trim();
+      const prev = currentUser;
+      currentUser = next;
+      log(`set-user: "${prev}" -> "${currentUser}"`);
+      sendJson(req, res, 200, { user: currentUser, previous: prev, default: DEFAULT_USER });
+    };
+    if (req.method === 'POST') {
+      let body = '';
+      req.on('data', (c) => { body += c; if (body.length > 4096) req.destroy(); });
+      req.on('end', () => {
+        let user = u.searchParams.get('user');
+        if (!user && body) {
+          const ct = req.headers['content-type'] || '';
+          try {
+            if (ct.includes('application/json')) user = JSON.parse(body).user;
+            else user = new URLSearchParams(body).get('user');
+          } catch (_) { /* 무시 — user 는 null 로 남아 리셋 */ }
+        }
+        applyUser(user);
+      });
+      return;
+    }
+    // GET (또는 기타 메서드): 쿼리스트링 user 사용.
+    applyUser(u.searchParams.get('user'));
+    return;
+  }
+
   // ── 편의 엔드포인트 ────────────────────────────────────────────────────
   if (path === '/whoami') {
-    sendJson(req, res, 200, { user: MOCK_USER });
+    sendJson(req, res, 200, { user: currentUser, default: DEFAULT_USER });
     return;
   }
   if (path === '/health') {
@@ -221,7 +260,7 @@ const server = http.createServer((req, res) => {
        <title>Mock ADFS SSO (contract 2.0.0)</title>
        <style>body{font-family:system-ui,Segoe UI,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;line-height:1.6}code{background:#f3f3f3;padding:2px 5px;border-radius:4px}</style>
        <h1>Mock ADFS/MobilAve SSO <small>(contract 2.0.0)</small></h1>
-       <p>기본 모킹 사용자: <strong>${MOCK_USER}</strong> · 관대모드: <strong>${LENIENT ? 'on' : 'off'}</strong></p>
+       <p>현재 모킹 사용자: <strong>${currentUser}</strong> (기본값 <code>${DEFAULT_USER}</code>) · 관대모드: <strong>${LENIENT ? 'on' : 'off'}</strong></p>
        <h3>SSO 흐름 (code 교환 + introspect)</h3>
        <ol>
          <li><code>GET /Account/ADFSLogin?client=&lt;origin&gt;</code> — 1회용 code 발급 후 <code>&lt;origin&gt;?auth=1&amp;code=…</code> 로 302 (<code>&amp;user=</code> 오버라이드)</li>
@@ -230,6 +269,7 @@ const server = http.createServer((req, res) => {
        </ol>
        <h3>기타</h3>
        <ul>
+         <li><code>GET /set-user?user=batman</code> (또는 <code>POST /set-user</code>) — 활성 사용자 런타임 변경(재기동 불필요). user 생략 시 기본값으로 리셋</li>
          <li><code>GET /Account/Logout?client=&lt;origin&gt;&amp;token=…</code> — 세션 무효화 후 복귀</li>
          <li><code>GET /whoami</code> · <code>GET /health</code></li>
        </ul>
@@ -245,6 +285,6 @@ REACT_APP_USE_SSO=true</pre>
 });
 
 server.listen(PORT, HOST, () => {
-  log(`listening on http://${HOST}:${PORT}  (contract 2.0.0, mock user: ${MOCK_USER}, lenient: ${LENIENT})`);
+  log(`listening on http://${HOST}:${PORT}  (contract 2.0.0, mock user: ${currentUser}, lenient: ${LENIENT})`);
   log(`set app:  REACT_APP_SSO_URL=http://localhost:${PORT}  &  REACT_APP_USE_SSO=true`);
 });
